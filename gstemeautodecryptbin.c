@@ -27,7 +27,8 @@ static void gst_eme_auto_decrypt_bin_dispose (GObject * object);
 static void gst_eme_auto_decrypt_bin_finalize (GObject * object);
 static GstStateChangeReturn gst_eme_auto_decrypt_bin_change_state (GstElement * element, GstStateChange transition);
 static gboolean bus_message_cb (GstBus * bus, GstMessage * message, gpointer user_data);
-static void license_request_finished_cb (SoupSession * session, SoupMessage * msg, gpointer user_data);
+// Fix: Updated function signature to match the implementation
+static void license_request_finished_cb (GObject * source_object, GAsyncResult * res, gpointer user_data);
 
 typedef struct {
     GstEmeAutoDecryptBin *bin;
@@ -186,7 +187,7 @@ remove_bus_watch (GstEmeAutoDecryptBin * self) {
     if (self->bus_watch_id != 0) {
         GST_DEBUG_OBJECT(self, "Removing bus watch id %u", self->bus_watch_id);
         g_source_remove (self->bus_watch_id);
- аспекты>self->bus_watch_id = 0;
+        self->bus_watch_id = 0;
     }
 }
 
@@ -290,60 +291,82 @@ gst_eme_auto_decrypt_bin_change_state (GstElement * element, GstStateChange tran
 }
 
 // Callback for the HTTP request completion
-static void
-license_request_finished_cb (SoupSession * session, SoupMessage * msg, gpointer user_data)
+// Fix: Changed the function signature from SoupSession to GObject
+static void license_request_finished_cb (GObject * source_object, GAsyncResult * res, gpointer user_data)
 {
+    GError *error = NULL;
     LicenseRequestContext *ctx = (LicenseRequestContext *) user_data;
     GstEmeAutoDecryptBin *self = ctx->bin;
     GstMediaKeySession *media_key_session = ctx->media_key_session; // Get the session pointer
     GstBuffer *response_buffer = NULL;
     GstPromise *update_promise = NULL;
+    
+    // Fix: Cast the source_object to SoupSession
+    SoupSession *session = SOUP_SESSION(source_object);
+    
+    // Get the HTTP response
+    GInputStream *input_stream = soup_session_send_finish (session, res, &error);
+    if (!input_stream) {
+        GST_ERROR_OBJECT (self, "Failed to get response: %s", error ? error->message : "unknown error");
+        g_clear_error (&error);
+        goto cleanup;
+    }
+    
+    // Read response data
+    GBytes *body = NULL;
+    {
+        GByteArray *byte_array = g_byte_array_new();
+        guint8 buffer[4096];
+        gssize bytes_read;
+        
+        while ((bytes_read = g_input_stream_read (input_stream, buffer, sizeof(buffer), NULL, &error)) > 0) {
+            g_byte_array_append (byte_array, buffer, bytes_read);
+        }
+        
+        if (bytes_read < 0) {
+            GST_ERROR_OBJECT (self, "Error reading response body: %s", error->message);
+            g_clear_error (&error);
+            g_byte_array_unref (byte_array);
+            g_object_unref (input_stream);
+            goto cleanup;
+        }
+        
+        body = g_byte_array_free_to_bytes (byte_array);
+        g_object_unref (input_stream);
+    }
 
     // Check if the session object is still valid
     if (!media_key_session || !GST_IS_MEDIA_KEY_SESSION(media_key_session)) {
         GST_WARNING_OBJECT(self, "Media key session is no longer valid in callback");
+        g_bytes_unref (body);
         goto cleanup;
     }
 
-    GST_INFO_OBJECT (self, "License request finished, status: %u %s",
-        msg->status_code, msg->reason_phrase);
+    GST_INFO_OBJECT (self, "License request finished successfully");
 
-    if (SOUP_STATUS_IS_SUCCESSFUL (msg->status_code)) {
-        if (msg->response_body && msg->response_body->data) {
-            // Create GstBuffer from response body (takes ownership)
-            response_buffer = gst_buffer_new_wrapped_bytes(
-                g_bytes_new_take(msg->response_body->data, msg->response_body->length));
-             // Need to ensure response_body data is not freed by libsoup now
-             msg->response_body->data = NULL;
-             msg->response_body->length = 0;
+    if (body && g_bytes_get_size (body) > 0) {
+        gsize body_size = g_bytes_get_size (body);
+        // Create GstBuffer from response body
+        gpointer data_copy = g_memdup2 (g_bytes_get_data (body, NULL), body_size);
+        response_buffer = gst_buffer_new_wrapped (data_copy, body_size);
+        
+        GST_INFO_OBJECT(self, "Received license response, size: %" G_GSIZE_FORMAT, body_size);
 
-            GST_INFO_OBJECT(self, "Received license response, size: %" G_GSIZE_FORMAT,
-                            gst_buffer_get_size(response_buffer));
+        // Call gst_media_key_session_update
+        update_promise = gst_promise_new();
+        gst_media_key_session_update(media_key_session, response_buffer, update_promise);
 
-            // Call gst_media_key_session_update
-            // IMPORTANT: Need the correct GstMediaKeySession object here!
-            // Using the one passed in user_data (needs careful management).
-            update_promise = gst_promise_new();
-            gst_media_key_session_update(media_key_session, response_buffer, update_promise);
-
-            // Optionally wait for or handle the update promise result
-            // For simplicity, we are not waiting here. A real app might.
-            GST_DEBUG_OBJECT(self, "Called gst_media_key_session_update");
-            // gst_promise_unref(update_promise); // Unref if not waiting
-
-        } else {
-            GST_ERROR_OBJECT (self, "License server returned success but no response body");
-            gst_element_post_message(GST_ELEMENT(self),
-                gst_message_new_error(GST_OBJECT(self), g_error_new(GST_CORE_ERROR, GST_CORE_ERROR_FAILED, "License server success but no body"), "License Error"));
-        }
+        // Optionally wait for or handle the update promise result
+        GST_DEBUG_OBJECT(self, "Called gst_media_key_session_update");
+        
+        g_bytes_unref (body);
     } else {
-        GST_ERROR_OBJECT (self, "License request failed: %u %s", msg->status_code, msg->reason_phrase);
-        if (msg->response_body && msg->response_body->data) {
-             GST_ERROR_OBJECT (self, "Server response body: %.*s", (int)msg->response_body->length, msg->response_body->data);
+        GST_ERROR_OBJECT (self, "License server returned success but no response body");
+        gst_element_post_message(GST_ELEMENT(self),
+            gst_message_new_error(GST_OBJECT(self), g_error_new(GST_CORE_ERROR, GST_CORE_ERROR_FAILED, "License server success but no body"), "License Error"));
+        if (body) {
+            g_bytes_unref (body);
         }
-         gst_element_post_message(GST_ELEMENT(self),
-                gst_message_new_error(GST_OBJECT(self), g_error_new(GST_NETWORK_ERROR, GST_NETWORK_ERROR_FAILED, "License request failed: %u", msg->status_code), "License Error"));
-        // Here you might try rejecting the original promise if you tracked it
     }
 
 cleanup:
@@ -409,9 +432,9 @@ bus_message_cb (GstBus * bus, GstMessage * message, gpointer user_data)
         // Set request body from challenge buffer
         GstMapInfo map;
         if (gst_buffer_map (challenge_buffer, &map, GST_MAP_READ)) {
-             soup_message_set_request_body_from_bytes (soup_msg, "application/octet-stream",
-                                                  g_bytes_new_static (map.data, map.size));
-             gst_buffer_unmap (challenge_buffer, &map);
+            soup_message_set_request_body_from_bytes (soup_msg, "application/octet-stream",
+                                                 g_bytes_new_static (map.data, map.size));
+            gst_buffer_unmap (challenge_buffer, &map);
         } else {
              GST_ERROR_OBJECT(self, "Failed to map challenge buffer");
              g_object_unref(soup_msg);
@@ -420,21 +443,20 @@ bus_message_cb (GstBus * bus, GstMessage * message, gpointer user_data)
         }
 
         // Add any required custom headers here based on DRM provider needs
-        // soup_message_headers_append(soup_msg->request_headers, "X-Custom-Auth", "YourToken");
+        // soup_message_headers_append(soup_message_get_request_headers(soup_msg), "X-Custom-Auth", "YourToken");
 
         // Prepare user data for the callback
         LicenseRequestContext *ctx = g_slice_new(LicenseRequestContext);
         ctx->bin = gst_object_ref(self); // Ref self for callback
         ctx->media_key_session = session; // Transfer ref to context (will be unreffed in callback)
 
-        GST_INFO_OBJECT(self, "Queueing license request to %s", self->laurls);
-
-        // Queue the async request
-        soup_session_queue_message (self->soup_session, soup_msg,
-                                    license_request_finished_cb, ctx); // Pass context
-
-        g_object_unref (soup_msg); // soup session takes ownership
-
+        GST_INFO_OBJECT(self, "Sending license request to %s", self->laurls);
+        
+        // Send the request asynchronously
+        soup_session_send_async (self->soup_session, soup_msg, G_PRIORITY_DEFAULT,
+                              NULL, /* GCancellable */
+                              license_request_finished_cb, // Pass the correctly typed function
+                              ctx);
         // We've started handling it
         keep_watch = TRUE; // Keep watch active
     } else {
@@ -449,6 +471,27 @@ cleanup:
 
 // --- Plugin Entry Point ---
 
-// Defined in lib.rs or a separate file if using standard plugin template
-// static gboolean plugin_init (GstPlugin * plugin) { ... register element ... }
-// GST_PLUGIN_DEFINE (...)
+static gboolean
+plugin_init (GstPlugin * plugin)
+{
+    return gst_element_register (plugin, "emeautodecryptbin", GST_RANK_NONE,
+        GST_TYPE_EME_AUTO_DECRYPT_BIN);
+}
+
+// Define PACKAGE if not defined
+#ifndef PACKAGE
+#define PACKAGE "emeautodecryptbin"
+#endif
+
+// Plugin definition
+GST_PLUGIN_DEFINE (
+    GST_VERSION_MAJOR,
+    GST_VERSION_MINOR,
+    emeautodecryptbin,
+    "EME Auto Decrypt Bin",
+    plugin_init,
+    "1.0",
+    "LGPL",
+    "GStreamer",
+    "https://gstreamer.freedesktop.org/"
+)

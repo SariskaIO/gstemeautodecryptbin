@@ -1,3 +1,5 @@
+// gstemeautodecryptbin.h
+
 #ifndef __GST_EME_AUTO_DECRYPT_BIN_H__
 #define __GST_EME_AUTO_DECRYPT_BIN_H__
 
@@ -26,9 +28,11 @@ struct _GstEmeAutoDecryptBin {
     // Bus Watch
     guint bus_watch_id;
 
-    // Pad pointers for ghosting
+    // Pad pointers (needed temporarily during init for ghosting)
+    // ***** ADD THESE LINES *****
     GstPad *sinkpad;
     GstPad *srcpad;
+    // ***** END ADDED LINES *****
 };
 
 G_END_DECLS

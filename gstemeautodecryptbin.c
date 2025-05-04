@@ -6,8 +6,6 @@
 #include <gst/eme/gstmediakeysession.h> // For GstMediaKeySession type
 #include <libsoup/soup.h>
 
-#include <libxml/parser.h>
-#include <libxml/tree.h>
 
 #include "gstemeautodecryptbin.h"
 
